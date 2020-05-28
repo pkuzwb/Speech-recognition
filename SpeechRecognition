@@ -1,0 +1,372 @@
+/*
+算分project大作业 孤立数字的语音识别
+张文博 刘凡
+*/
+
+//#include "pch.h"
+//#define _CRT_SECURE_NO_WARNINGS
+#include<iostream>
+#include<stdio.h>
+#include<math.h>
+#include<algorithm>
+using namespace std;
+#define Pi 3.1415927 
+//FrameNum为帧数,FrameLength为每一帧的长度
+#define FrameNum 100
+#define FrameLength 256
+//FilterNum为mel滤波器的阶数
+#define FilterNum 40
+//Sample为样本的最高频率
+#define SampleRate 16000
+#define NN 256
+#define M 100
+#define K 100
+//初始样本数据0-9,以及输入的一组待识别数据(放入odata[10]) 
+double odata[11][10000] = {};
+//加窗分帧之后得到data1 
+double data1[FrameNum + 1][FrameLength + 1] = {};
+//FFT并平方之后得到data2
+double data2[FrameNum + 1][FrameLength + 1] = {};
+//梅尔滤波器处理之后得到mel
+double mel[FrameNum + 1][FilterNum + 1] = {};
+//DCT后的结果,这里取了13维
+double result[M][K] = {};
+void enframe(int num, int wlen, int inc)
+{
+	//N为数据个数，wlen为帧长，inc为帧移
+	int N = sizeof(odata[num]) / sizeof(odata[num][0]);
+	//计算帧数fn
+	int fn = ceil(1.0*(N - wlen) / inc + 1);
+	double arr[FrameNum + 1][FrameLength + 1] = {};
+	int i, j, k;
+	for (i = 0; i < fn; i++)
+	{
+		//向前fn-1帧（矩阵arr的前fn-1行）存入数据
+		if (i < fn - 1)
+		{
+			//前fn-1行每行存入wlen个数据
+			for (j = 0, k = inc * i; j < wlen, k < inc*i + wlen; j++, k++)
+				data1[i][j] = odata[num][k];
+		}
+		//向第fn帧（矩阵arr的第fn行）存入数据
+		else
+		{
+			for (j = 0, k = inc * i; j < N - (fn - 1)*inc, k <= inc * i + (N - (fn - 1)*inc); j++, k++)	//最后一行存入N-(fn-1)*inc个数据
+				data1[i][j] = odata[num][k];
+		}
+	}
+}
+//位反转，用于fft的计算
+void bitrp(double* x, int n) {
+	int a, b, p = 0;
+	for (int i = 1, p = 0; i < n; i *= 2) {
+		p++;
+	}
+	for (int i = 0; i < n; i++) {
+		a = i;
+		b = 0;
+		for (int j = 0; j < p; j++) {
+			b = (b << 1) + (a & 1);// b = b * 2 + a % 2
+			a >>= 1;// a = a / 2;
+		}
+		if (b > i) {
+			double temp;
+			temp = x[i];
+			x[i] = x[b];
+			x[b] = temp;
+		}
+	}
+}
+//对分帧加窗后的各帧信号进行FFT变换得到各帧的频谱再平方得到功率谱
+//由于帧长256为2的幂次，因而直接分奇偶进行变换
+void FFT() {
+	for (int i = 1; i <= FrameNum; i++) {
+		double real[FrameLength] = {};
+		double image[FrameLength] = {};
+		//x辅助计算
+		double xreal[FrameLength] = {};
+		xreal[0] = 1.0;
+		double ximage[FrameLength] = {};
+		ximage[0] = 0.0;
+		for (int j = 0; j < FrameLength; j++) {
+			real[j] = data1[i][j];
+		}
+		bitrp(real, FrameLength);
+		double arg = -2 * Pi / FrameLength;
+		double treal = cos(arg);
+		double timage = sin(arg);
+		for (int j = 1; j < FrameLength / 2; j++) {
+			xreal[j] = xreal[j - 1] * treal - ximage[j - 1] * timage;
+			ximage[j] = xreal[j - 1] * timage + ximage[j - 1] * treal;
+		}
+		int index1, index2, t;
+		for (int m = 2; m <= FrameLength; m *= 2) {
+			for (int k = 0; k < FrameLength; k += m) {
+				for (int j = 0; j < m / 2; j++) {
+					index1 = k + j;
+					index2 = index1 + m / 2;
+					t = FrameLength * j / m;
+					treal = xreal[t] * real[index2] - ximage[t] * image[index2];
+					timage = xreal[t] * image[index2] + ximage[t] * real[index2];
+					double a = real[index1];
+					double b = image[index1];
+					real[index1] = a + treal;
+					image[index1] = b + timage;
+					real[index2] = a - treal;
+					image[index2] = b - timage;
+				}
+			}
+		}
+		for (int j = 0; j < FrameLength; j++) {
+			data2[i][j + 1] = real[j] * real[j] + image[j] * image[j];
+		}
+	}
+}
+
+
+void computeMel() {
+	//实际最大频率和最小频率 
+	double fmax = SampleRate / 2;
+	double fmin = 0;
+	//将实际频率转换成梅尔频率 
+	double melFmax = 1125 * log(1 + fmax / 700);
+	double melFmin = 1125 * log(1 + fmin / 700);
+	double melFilters[FilterNum][3] = {};
+	double k = (melFmax - melFmin) / (FilterNum + 1);
+	double *f = new double[FilterNum + 2];
+	//计算f数组
+	for (int i = 0; i < FilterNum + 2; i++) {
+		double m = melFmin + k * i;
+		double h = 700 * (exp(m / 1125) - 1);
+		f[i] = floor((FrameLength + 1)*h / SampleRate);
+	}
+	//按照公式对每一帧进行处理 	
+	for (int i = 1; i <= FrameNum; i++) {
+		for (int j = 1; j <= FilterNum; j++) {
+			double temp = 0;
+			for (int z = 1; z <= FrameLength; z++) {
+				if (z < f[j - 1])
+					temp = 0;
+				else if (z >= f[j - 1] && z <= f[j])
+					temp = (z - f[j - 1]) / (f[j] - f[j - 1]);
+				else if (z >= f[j] && z <= f[j + 1])
+					temp = (f[j + 1] - z) / (f[j + 1] - f[j]);
+				else if (z > f[j + 1])
+					temp = 0;
+				mel[i][j] += data2[i][z] * temp;
+			}
+			if (mel[i][j] == 0)mel[i][j] = -10;
+			else mel[i][j] = log(mel[i][j]);
+		}
+	}
+}
+//DCT只需考虑实部，相比于FFT十分简洁
+void DCT() {
+	for (int i = 1; i <= FrameNum; i++) {
+		for (int j = 0; j < 16; j++) {
+			for (int k = 1; k <= FilterNum; k++) {
+				result[i][j] += mel[i][k] * cos(Pi*j / (2 * FilterNum)*(2 * k - 1));
+			}
+		}
+	}
+}
+//feature1为样本特征，feature2实待匹配序列的特征
+double feature1[M][K] = {};
+double feature2[M][K] = {};
+void mfcc(int i) {
+	//i=10是待匹配序列的特征
+	enframe(i, NN, 80);
+	if (i == 10)
+		printf("Finish enframe!\n");
+	FFT();
+	if (i == 10)
+		printf("Finish FFT!\n");
+	computeMel();
+	if (i == 10)
+		printf("Finish computeMel!\n");
+	DCT();
+	if (i == 10)
+		printf("Finish DCT!\n");
+}
+double d[17] = {};
+double D[17] = {};
+#define MAX  100000;
+//dist即为两特征间的距离
+double dist = 0;
+int y_max;
+int y_min;
+//这是dtw的第二部分
+void model2(int x)
+{
+	for (int i = 1; i <= 16; i++)
+	{
+		d[i] = D[i];
+	}
+	for (int y = y_min; y <= y_max; y++)
+	{
+		double D1 = D[y];
+		double D2, D3;
+		if (y > 1)D2 = D[y - 1];
+		else D2 = MAX;
+		if (y > 2)D3 = D[y - 2];
+		else D3 = MAX;
+		d[y] = min(D1, min(D2, D3));
+		for (int j = 1; j <= 24; j++)
+		{
+			d[y] += (feature1[x][j] - feature2[y][j])*(feature1[x][j] - feature2[y][j]);
+		}
+	}
+	for (int i = 1; i <= 16; i++)
+	{
+		D[i] = d[i];
+	}
+}
+//这才是dtw的第一部分
+void dtw()
+{
+	int i;
+	int n = 16;
+	int m = 16;
+	for (i = 1; i <= 16; i++) {
+		d[i] = 0.0;
+		D[i] = MAX;
+	}
+
+	D[1] = 0.0;
+	dist = 1.0;
+
+	//如果两个模板长度相差过多，匹配失败
+	if ((2.0 * m - n < 3.0) || (2.0 * n - m < 2.0)) {
+		dist = MAX;
+		return;
+	}
+
+	int xa = round((2 * m - n) / 3);
+	int xb = round((2 * n - m) * 2 / 3);
+	//先匹配前三分之一
+	if (xb > xa)
+	{
+		for (int x = 1; x <= xa; x++)
+		{
+			y_max = 2 * x;
+			y_min = round(0.5*x);
+			model2(x);
+		}
+		for (int x = xa + 1; x <= xb; x++)
+		{
+			y_max = round(0.5*(x - n) + m);
+			y_min = round(0.5*x);
+			model2(x);
+		}
+		for (int x = xb + 1; x <= n; x++)
+		{
+			y_max = round(0.5*(x - n) + m);
+			round(2 * (x - n) + m);
+			model2(x);
+		}
+	}
+	else if (xa > xb)
+	{
+		for (int x = 1; x <= xb; x++)
+		{
+			y_max = 2 * x;
+			y_min = round(0.5*x);
+			model2(x);
+		}
+		for (int x = xb + 1; x <= xa; x++)
+		{
+			y_max = 2 * x;
+			y_min = round(2 * (x - n) + m);
+			model2(x);
+		}
+		for (int x = xa + 1; x <= n; x++)
+		{
+			y_max = round(0.5*(x - n) + m);
+			y_min = round(2 * (x - n) + m);
+			model2(x);
+		}
+	}
+	else
+	{
+		for (int x = 1; x <= xa; x++)
+		{
+			y_max = 2 * x;
+			y_min = round(0.5*x);
+			model2(x);
+		}
+		for (int x = xa + 1; x <= n; x++)
+		{
+			y_max = round(0.5*(x - n) + m);
+			y_min = round(2 * (x - n) + m);
+			model2(x);
+		}
+	}
+	dist = d[16];
+	return;
+}
+
+int main() {
+	//这里是样本的文件地址格式为txt
+	FILE* d = fopen("C:/Users/zwb/Desktop/sp.txt", "r");
+	if (d == NULL)
+		printf("Opening file1 failed!\n");
+	for (int i = 0; i < 10; i++) {
+		for (int j = 0; j < 8000; j++) {
+			fscanf(d, "%lg", odata[i] + j);
+		}
+	}
+	if (fclose(d) != 0)
+		printf("Close file1 error\n");
+	//这里是待匹配序列的文件地址格式为txt
+	FILE* x = fopen("C:/Users/zwb/Desktop/x.txt", "r");
+	if (x == NULL)
+		printf("Opening file2 failed!\n");
+	for (int i = 0; i < 8000; i++) {
+		fscanf(x, "%lg", odata[10] + i);
+	}
+	if (fclose(x) != 0)
+		printf("Close file2 error\n");
+	double distance[11] = {};
+	//先处理待匹配的数据，将特征放入feature2
+	mfcc(10);
+	for (int j = 1; j <= M; j++) {
+		for (int k = 1; k <= K; k++) {
+			feature2[j][k] = result[j][k];
+		}
+	}
+	//在处理样本数据，将特征放入feature1
+	for (int i = 0; i < 10; i++) {
+		memset(data1, 0, sizeof(data1));
+		memset(data2, 0, sizeof(data2));
+		memset(mel, 0, sizeof(mel));
+		memset(result, 0, sizeof(result));
+		mfcc(i);
+		for (int j = 1; j <= M; j++) {
+			for (int k = 1; k <= K; k++) {
+				feature1[j][k] = result[j][k];
+			}
+		}
+		//放置在test中
+		//重复一遍放在ref中，调用dtw 
+		dtw();
+		printf("Finish dtw %d!\n", i);
+		distance[i] = dist;
+	}
+	//当相差过大的时候，认为没有相匹配的结果
+	int out = 10000;
+	double minDis = distance[0];
+	//h是最短距离对应的语音。
+	int h = 0;
+	for (int i = 0; i < 10; i++)
+	{
+		if (minDis > distance[i]) {
+			h = i;
+			minDis = distance[i];
+		}
+	}
+	if (minDis <= out)
+		cout << "result:" << h << endl;
+	else
+		cout << "No result" << endl;
+	return 0;
+}
